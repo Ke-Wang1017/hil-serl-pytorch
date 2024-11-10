@@ -1,47 +1,43 @@
 import os
 from typing import List, Optional
-
 import gymnasium as gym
 import imageio
 import numpy as np
-import tensorflow as tf
-
-# Take from
-# https://github.com/denisyarats/pytorch_sac/
+import torch
+from pathlib import Path
 
 
 def compose_frames(
     all_frames: List[np.ndarray],
     num_videos_per_row: int,
     margin: int = 4,
-):
+) -> List[np.ndarray]:
+    """Compose multiple video frames into a grid layout."""
     num_episodes = len(all_frames)
-
-    if num_videos_per_row is None:
-        num_videos_per_row = num_episodes
+    num_videos_per_row = num_videos_per_row or num_episodes
 
     t = 0
     end_of_all_epidoes = False
     frames_to_save = []
+    
     while not end_of_all_epidoes:
         frames_t = []
 
         for i in range(num_episodes):
-            # If the episode is shorter, repeat the last frame.
+            # If the episode is shorter, repeat the last frame
             t_ = min(t, len(all_frames[i]) - 1)
             frame_i_t = all_frames[i][t_]
 
-            # Add the lines.
+            # Add margins
             frame_i_t = np.pad(
                 frame_i_t,
                 [[margin, margin], [margin, margin], [0, 0]],
-                "constant",
+                mode="constant",
                 constant_values=0,
             )
-
             frames_t.append(frame_i_t)
 
-        # Arrange the videos based on num_videos_per_row.
+        # Arrange videos in grid
         frame_t = None
         while len(frames_t) >= num_videos_per_row:
             frames_t_this_row = frames_t[:num_videos_per_row]
@@ -61,11 +57,13 @@ def compose_frames(
 
 
 class VideoRecorder(gym.Wrapper):
+    """Wrapper for recording videos of environment episodes."""
+    
     def __init__(
         self,
         env: gym.Env,
         save_folder: str = "",
-        save_prefix: str = None,
+        save_prefix: Optional[str] = None,
         height: int = 128,
         width: int = 128,
         fps: int = 30,
@@ -73,8 +71,8 @@ class VideoRecorder(gym.Wrapper):
         goal_conditioned: bool = False,
     ):
         super().__init__(env)
-
-        self.save_folder = save_folder
+        
+        self.save_folder = Path(save_folder)
         self.save_prefix = save_prefix
         self.height = height
         self.width = width
@@ -83,43 +81,45 @@ class VideoRecorder(gym.Wrapper):
         self.frames = []
         self.goal_conditioned = goal_conditioned
 
-        if not tf.io.gfile.exists(save_folder):
-            tf.io.gfile.makedirs(save_folder)
+        # Create save directory if it doesn't exist
+        self.save_folder.mkdir(parents=True, exist_ok=True)
 
         self.num_record_episodes = -1
-
         self.num_videos = 0
-
-        # self.all_save_paths = None
         self.current_save_path = None
 
-    def start_recording(self, num_episodes: int = None, num_videos_per_row: int = None):
+    def start_recording(self, num_episodes: Optional[int] = None, num_videos_per_row: Optional[int] = None):
+        """Start recording episodes."""
         if num_videos_per_row is not None and num_episodes is not None:
             assert num_episodes >= num_videos_per_row
 
         self.num_record_episodes = num_episodes
         self.num_videos_per_row = num_videos_per_row
-
-        # self.all_save_paths = []
         self.all_frames = []
 
     def stop_recording(self):
+        """Stop recording episodes."""
         self.num_record_episodes = None
 
-    def step(self, action: np.ndarray):  # NOQA
-
+    def step(self, action: np.ndarray):
+        """Execute environment step and record frame if recording is enabled."""
         if self.num_record_episodes is None or self.num_record_episodes == 0:
-            observation, reward, terminated, truncated, info = self.env.step(action)
+            return self.env.step(action)
 
         elif self.num_record_episodes > 0:
+            # Render frame
             frame = self.env.render(
-                height=self.height, width=self.width, camera_id=self.camera_id
+                height=self.height,
+                width=self.width,
+                camera_id=self.camera_id
             )
 
             if frame is None:
                 try:
                     frame = self.sim.render(
-                        width=self.width, height=self.height, mode="offscreen"
+                        width=self.width,
+                        height=self.height,
+                        mode="offscreen"
                     )
                     frame = np.flipud(frame)
                 except Exception:
@@ -144,34 +144,36 @@ class VideoRecorder(gym.Wrapper):
                     self.num_record_episodes -= 1
 
                 if self.num_record_episodes is None:
-                    # Plot one episode per file.
+                    # Save single episode
                     frames_to_save = frames
                     should_save = True
                 elif self.num_record_episodes == 0:
-                    # Plot all episodes in one file.
+                    # Save grid of episodes
                     frames_to_save = compose_frames(
-                        self.all_frames, self.num_videos_per_row
+                        self.all_frames,
+                        self.num_videos_per_row
                     )
                     should_save = True
                 else:
                     should_save = False
 
                 if should_save:
-                    filename = "%08d.mp4" % (self.num_videos)
-                    if self.save_prefix is not None and self.save_prefix != "":
+                    filename = f"{self.num_videos:08d}.mp4"
+                    if self.save_prefix:
                         filename = f"{self.save_prefix}_{filename}"
-                    self.current_save_path = tf.io.gfile.join(
-                        self.save_folder, filename
+                    
+                    self.current_save_path = self.save_folder / filename
+                    imageio.mimsave(
+                        self.current_save_path,
+                        frames_to_save,
+                        format='MP4',
+                        fps=self.fps
                     )
-
-                    with tf.io.gfile.GFile(self.current_save_path, "wb") as f:
-                        imageio.mimsave(f, frames_to_save, "MP4", fps=self.fps)
-
                     self.num_videos += 1
 
                 self.frames = []
 
+            return observation, reward, terminated, truncated, info
+
         else:
             raise ValueError("Do not forget to call start_recording.")
-
-        return observation, reward, terminated, truncated, info

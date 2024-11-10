@@ -3,9 +3,9 @@ from typing import Iterable, Optional, Tuple
 
 import gymnasium as gym
 import numpy as np
+import torch
 from serl_launcher.data.dataset import DatasetDict, _sample
 from serl_launcher.data.replay_buffer import ReplayBuffer
-from flax.core import frozen_dict
 from gymnasium.spaces import Box
 
 
@@ -98,7 +98,8 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
         keys: Optional[Iterable[str]] = None,
         indx: Optional[np.ndarray] = None,
         pack_obs_and_next_obs: bool = False,
-    ) -> frozen_dict.FrozenDict:
+        device: Optional[torch.device] = None,
+    ) -> dict:
         """Samples from the replay buffer.
 
         Args:
@@ -107,11 +108,11 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
             indx: Take indices instead of sampling.
             pack_obs_and_next_obs: whether to pack img and next_img into one image.
                 It's useful when they have overlapping frames.
+            device: Device to place tensors on.
 
         Returns:
-            A frozen dictionary.
+            A dictionary of sampled data.
         """
-
         if indx is None:
             if hasattr(self.np_random, "integers"):
                 indx = self.np_random.integers(len(self), size=batch_size)
@@ -135,7 +136,6 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
         keys = list(keys)
         keys.remove("observations")
         batch = super().sample(batch_size, keys, indx)
-        batch = batch.unfreeze()
 
         obs_keys = self.dataset_dict["observations"].keys()
         obs_keys = list(obs_keys)
@@ -154,7 +154,7 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
                 obs_pixels, self._num_stack + 1, axis=0
             )
             obs_pixels = obs_pixels[indx - self._num_stack]
-            # transpose from (B, H, W, C, T) to (B, T, H, W, C) to follow jaxrl_m convention
+            # transpose from (B, H, W, C, T) to (B, T, H, W, C) to follow convention
             obs_pixels = obs_pixels.transpose((0, 4, 1, 2, 3))
 
             if pack_obs_and_next_obs:
@@ -164,4 +164,11 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
                 if "next_observations" in keys:
                     batch["next_observations"][pixel_key] = obs_pixels[:, 1:, ...]
 
-        return frozen_dict.freeze(batch)
+        # Convert numpy arrays to torch tensors and move to device if specified
+        if device is not None:
+            batch = {
+                k: torch.tensor(v, device=device) if isinstance(v, np.ndarray) else v
+                for k, v in batch.items()
+            }
+
+        return batch

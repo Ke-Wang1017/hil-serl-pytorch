@@ -1,130 +1,151 @@
 from functools import partial
 from typing import Any, Iterable, Optional
-
-import flax
-import flax.linen as nn
-import jax
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
+import torch.optim as optim
 import numpy as np
-import optax
-from flax.core import FrozenDict
+from dataclasses import dataclass
 
-from serl_launcher.common.common import JaxRLTrainState, ModuleDict, nonpytree_field
 from serl_launcher.common.encoding import EncodingWrapper
-from serl_launcher.common.typing import Batch, PRNGKey
-from serl_launcher.networks.actor_critic_nets import Policy
+from serl_launcher.common.typing import Batch
+from serl_launcher.serl_launcher.networks.actor_critic_nets import Policy
 from serl_launcher.networks.mlp import MLP
 from serl_launcher.utils.train_utils import _unpack
 from serl_launcher.vision.data_augmentations import batched_random_crop
 
 
-class BCAgent(flax.struct.PyTreeNode):
-    state: JaxRLTrainState
-    config: dict = nonpytree_field()
+@dataclass
+class TrainState:
+    model: nn.Module
+    optimizer: torch.optim.Optimizer
+    target_params: Optional[dict] = None
+    rng: Optional[torch.Generator] = None
+    
+    def state_dict(self):
+        return {
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+            'target_params': self.target_params,
+        }
+    
+    def load_state_dict(self, state_dict):
+        self.model.load_state_dict(state_dict['model'])
+        self.optimizer.load_state_dict(state_dict['optimizer'])
+        self.target_params = state_dict['target_params']
 
-    def data_augmentation_fn(self, rng, observations):
+
+class BCAgent:
+    def __init__(self, state: TrainState, config: dict):
+        self.state = state
+        self.config = config
+        self.device = next(state.model.parameters()).device
+
+    def data_augmentation_fn(self, observations):
         for pixel_key in self.config["image_keys"]:
-            observations = observations.copy(
-                add_or_replace={
-                    pixel_key: batched_random_crop(
-                        observations[pixel_key], rng, padding=4, num_batch_dims=2
-                    )
-                }
+            observations = observations.copy()
+            observations[pixel_key] = batched_random_crop(
+                observations[pixel_key], padding=4, num_batch_dims=2
             )
         return observations
 
-    @partial(jax.jit, static_argnames="pmap_axis")
-    def update(self, batch: Batch, pmap_axis: str = None):
+    def update(self, batch: Batch):
         if self.config["image_keys"][0] not in batch["next_observations"]:
             batch = _unpack(batch)
 
-        rng, aug_rng = jax.random.split(self.state.rng)
-        if "augmentation_function" in self.config.keys() and self.config["augmentation_function"] is not None:
-            batch = self.config["augmentation_function"](batch, aug_rng)
+        if "augmentation_function" in self.config and self.config["augmentation_function"] is not None:
+            batch = self.config["augmentation_function"](batch)
 
-        def loss_fn(params, rng):
-            rng, key = jax.random.split(rng)
-            dist = self.state.apply_fn(
-                {"params": params},
-                batch["observations"],
-                temperature=1.0,
-                train=True,
-                rngs={"dropout": key},
-                name="actor",
-            )
-            pi_actions = dist.mode()
-            log_probs = dist.log_prob(batch["actions"])
-            mse = ((pi_actions - batch["actions"]) ** 2).sum(-1)
-            actor_loss = -(log_probs).mean()
+        self.state.model.train()
+        self.state.optimizer.zero_grad()
 
-            return actor_loss, {
-                "actor_loss": actor_loss,
-                "mse": mse.mean(),
-            }
+        # Move batch to device
+        observations = {k: torch.tensor(v, device=self.device) for k, v in batch["observations"].items()}
+        actions = torch.tensor(batch["actions"], device=self.device)
 
-        # compute gradients and update params
-        new_state, info = self.state.apply_loss_fns(
-            loss_fn, pmap_axis=pmap_axis, has_aux=True
-        )
-
-        return self.replace(state=new_state), info
-    
-    def forward_policy(self, observations: np.ndarray, *, temperature: float = 1.0, non_squash_distribution: bool = False):
-        dist = self.state.apply_fn(
-            {"params": self.state.params},
+        # Forward pass
+        dist = self.state.model(
             observations,
-            train=False,
-            temperature=temperature,
-            name="actor",
-            non_squash_distribution=non_squash_distribution
-        )
-        return dist
-
-    @partial(jax.jit, static_argnames="argmax")
-    def sample_actions(
-        self,
-        observations: np.ndarray,
-        *,
-        seed: Optional[PRNGKey] = None,
-        temperature: float = 1.0,
-        argmax=False,
-    ) -> jnp.ndarray:
-        dist = self.state.apply_fn(
-            {"params": self.state.params},
-            observations,
-            temperature=temperature,
-            name="actor",
-        )
-        if argmax:
-            actions = dist.mode()
-        else:
-            actions = dist.sample(seed=seed)
-        return actions
-
-    @jax.jit
-    def get_debug_metrics(self, batch, **kwargs):
-        dist = self.state.apply_fn(
-            {"params": self.state.params},
-            batch["observations"],
             temperature=1.0,
+            train=True,
             name="actor",
         )
         pi_actions = dist.mode()
-        log_probs = dist.log_prob(batch["actions"])
-        mse = ((pi_actions - batch["actions"]) ** 2).sum(-1)
+        log_probs = dist.log_prob(actions)
+        mse = ((pi_actions - actions) ** 2).sum(-1)
+        actor_loss = -(log_probs).mean()
+
+        # Backward pass and optimize
+        actor_loss.backward()
+        self.state.optimizer.step()
+
+        info = {
+            "actor_loss": actor_loss.item(),
+            "mse": mse.mean().item(),
+        }
+
+        return info
+    
+    def forward_policy(self, observations: dict, *, temperature: float = 1.0, non_squash_distribution: bool = False):
+        self.state.model.eval()
+        with torch.no_grad():
+            observations = {k: torch.tensor(v, device=self.device) for k, v in observations.items()}
+            dist = self.state.model(
+                observations,
+                train=False,
+                temperature=temperature,
+                name="actor",
+                non_squash_distribution=non_squash_distribution
+            )
+        return dist
+
+    def sample_actions(
+        self,
+        observations: dict,
+        *,
+        temperature: float = 1.0,
+        argmax: bool = False,
+    ) -> torch.Tensor:
+        self.state.model.eval()
+        with torch.no_grad():
+            observations = {k: torch.tensor(v, device=self.device) for k, v in observations.items()}
+            dist = self.state.model(
+                observations,
+                temperature=temperature,
+                name="actor",
+            )
+            if argmax:
+                actions = dist.mode()
+            else:
+                actions = dist.sample()
+        return actions.cpu().numpy()
+
+    def get_debug_metrics(self, batch):
+        self.state.model.eval()
+        with torch.no_grad():
+            observations = {k: torch.tensor(v, device=self.device) for k, v in batch["observations"].items()}
+            actions = torch.tensor(batch["actions"], device=self.device)
+            
+            dist = self.state.model(
+                observations,
+                temperature=1.0,
+                name="actor",
+            )
+            pi_actions = dist.mode()
+            log_probs = dist.log_prob(actions)
+            mse = ((pi_actions - actions) ** 2).sum(-1)
 
         return {
-            "mse": mse,
-            "log_probs": log_probs,
-            "pi_actions": pi_actions,
+            "mse": mse.cpu().numpy(),
+            "log_probs": log_probs.cpu().numpy(),
+            "pi_actions": pi_actions.cpu().numpy(),
         }
 
     @classmethod
     def create(
         cls,
-        rng: PRNGKey,
-        observations: FrozenDict,
-        actions: jnp.ndarray,
+        device: torch.device,
+        observations: dict,
+        actions: np.ndarray,
         # Model architecture
         encoder_type: str = "resnet-pretrained",
         image_keys: Iterable[str] = ("image",),
@@ -182,30 +203,24 @@ class BCAgent(flax.struct.PyTreeNode):
         )
 
         network_kwargs["activate_final"] = True
-        networks = {
-            "actor": Policy(
-                encoder_def,
-                MLP(**network_kwargs),
-                action_dim=actions.shape[-1],
-                **policy_kwargs,
-            )
-        }
+        network = MLP(**network_kwargs)
+        
+        model = Policy(
+            encoder_def,
+            network,
+            action_dim=actions.shape[-1],
+            **policy_kwargs,
+        ).to(device)
 
-        model_def = ModuleDict(networks)
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
 
-        tx = optax.adam(learning_rate)
-
-        rng, init_rng = jax.random.split(rng)
-        params = model_def.init(init_rng, actor=[observations])["params"]
-
-        rng, create_rng = jax.random.split(rng)
-        state = JaxRLTrainState.create(
-            apply_fn=model_def.apply,
-            params=params,
-            txs=tx,
-            target_params=params,
-            rng=create_rng,
+        state = TrainState(
+            model=model,
+            optimizer=optimizer,
+            target_params=model.state_dict().copy(),
+            rng=torch.Generator(device=device),
         )
+
         config = dict(
             image_keys=image_keys,
             augmentation_function=augmentation_function

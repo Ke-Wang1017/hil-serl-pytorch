@@ -1,8 +1,11 @@
 from threading import Lock
 from typing import Union, Iterable
+import pickle as pkl
+import numpy as np
+from copy import deepcopy
 
 import gymnasium as gym
-import jax
+import torch
 from serl_launcher.data.replay_buffer import ReplayBuffer
 from serl_launcher.data.memory_efficient_replay_buffer import (
     MemoryEfficientReplayBuffer,
@@ -80,19 +83,27 @@ class MemoryEfficientReplayBufferDataStore(MemoryEfficientReplayBuffer, DataStor
 def populate_data_store(
     data_store: DataStoreBase,
     demos_path: str,
-):
+) -> DataStoreBase:
     """
     Utility function to populate demonstrations data into data_store.
-    :return data_store
+    
+    Args:
+        data_store: The data store to populate
+        demos_path: Path to demonstration files
+        
+    Returns:
+        Populated data store
     """
-    import pickle as pkl
-    import numpy as np
-    from copy import deepcopy
-
     for demo_path in demos_path:
         with open(demo_path, "rb") as f:
             demo = pkl.load(f)
             for transition in demo:
+                # Convert numpy arrays to torch tensors if needed
+                if isinstance(transition, dict):
+                    transition = {
+                        k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v
+                        for k, v in transition.items()
+                    }
                 data_store.insert(transition)
         print(f"Loaded {len(data_store)} transitions.")
     return data_store
@@ -101,37 +112,47 @@ def populate_data_store(
 def populate_data_store_with_z_axis_only(
     data_store: DataStoreBase,
     demos_path: str,
-):
+) -> DataStoreBase:
     """
     Utility function to populate demonstrations data into data_store.
     This will remove the x and y cartesian coordinates from the state.
-    :return data_store
+    
+    Args:
+        data_store: The data store to populate
+        demos_path: Path to demonstration files
+        
+    Returns:
+        Populated data store
     """
-    import pickle as pkl
-    import numpy as np
-    from copy import deepcopy
-
     for demo_path in demos_path:
         with open(demo_path, "rb") as f:
             demo = pkl.load(f)
             for transition in demo:
                 tmp = deepcopy(transition)
-                tmp["observations"]["state"] = np.concatenate(
-                    (
-                        tmp["observations"]["state"][:, :4],
-                        tmp["observations"]["state"][:, 6][None, ...],
-                        tmp["observations"]["state"][:, 10:],
-                    ),
-                    axis=-1,
-                )
-                tmp["next_observations"]["state"] = np.concatenate(
-                    (
-                        tmp["next_observations"]["state"][:, :4],
-                        tmp["next_observations"]["state"][:, 6][None, ...],
-                        tmp["next_observations"]["state"][:, 10:],
-                    ),
-                    axis=-1,
-                )
+                
+                # Process state data
+                state = tmp["observations"]["state"]
+                if isinstance(state, np.ndarray):
+                    state = torch.from_numpy(state)
+                
+                # Extract relevant coordinates
+                tmp["observations"]["state"] = torch.cat([
+                    state[:, :4],
+                    state[:, 6].unsqueeze(1),
+                    state[:, 10:],
+                ], dim=-1)
+                
+                # Process next state data
+                next_state = tmp["next_observations"]["state"]
+                if isinstance(next_state, np.ndarray):
+                    next_state = torch.from_numpy(next_state)
+                    
+                tmp["next_observations"]["state"] = torch.cat([
+                    next_state[:, :4],
+                    next_state[:, 6].unsqueeze(1),
+                    next_state[:, 10:],
+                ], dim=-1)
+                
                 data_store.insert(tmp)
         print(f"Loaded {len(data_store)} transitions.")
     return data_store

@@ -1,54 +1,80 @@
 import pickle as pkl
-import jax
-from jax import numpy as jnp
-import flax.linen as nn
-from flax.training.train_state import TrainState
-from flax.training import checkpoints
-import optax
-from typing import Callable, Dict, List
-
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from typing import Dict, List, Callable
+from dataclasses import dataclass
 
 from serl_launcher.vision.resnet_v1 import resnetv1_configs, PreTrainedResNetEncoder
 from serl_launcher.common.encoding import EncodingWrapper
 
 
 class BinaryClassifier(nn.Module):
-    encoder_def: nn.Module
-    hidden_dim: int = 256
+    def __init__(self, encoder_def: nn.Module, hidden_dim: int = 256):
+        super().__init__()
+        self.encoder_def = encoder_def
+        self.hidden_dim = hidden_dim
+        
+        self.dense1 = nn.Linear(encoder_def.output_dim, hidden_dim)
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dense2 = nn.Linear(hidden_dim, 1)
 
-    @nn.compact
-    def __call__(self, x, train=False):
+    def forward(self, x: torch.Tensor, train: bool = False) -> torch.Tensor:
         x = self.encoder_def(x, train=train)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.Dropout(0.1)(x, deterministic=not train)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        x = nn.Dense(1)(x)
+        x = self.dense1(x)
+        x = self.dropout(x) if train else x
+        x = self.layer_norm(x)
+        x = torch.relu(x)
+        x = self.dense2(x)
         return x
+
 
 class NWayClassifier(nn.Module):
-    encoder_def: nn.Module
-    hidden_dim: int = 256
-    n_way: int = 3
+    def __init__(self, encoder_def: nn.Module, hidden_dim: int = 256, n_way: int = 3):
+        super().__init__()
+        self.encoder_def = encoder_def
+        self.hidden_dim = hidden_dim
+        self.n_way = n_way
+        
+        self.dense1 = nn.Linear(encoder_def.output_dim, hidden_dim)
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_dim)
+        self.dense2 = nn.Linear(hidden_dim, n_way)
 
-    @nn.compact
-    def __call__(self, x, train=False):
+    def forward(self, x: torch.Tensor, train: bool = False) -> torch.Tensor:
         x = self.encoder_def(x, train=train)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.Dropout(0.1)(x, deterministic=not train)
-        x = nn.LayerNorm()(x)
-        x = nn.relu(x)
-        x = nn.Dense(self.n_way)(x)
+        x = self.dense1(x)
+        x = self.dropout(x) if train else x
+        x = self.layer_norm(x)
+        x = torch.relu(x)
+        x = self.dense2(x)
         return x
+
+
+@dataclass
+class TrainState:
+    model: nn.Module
+    optimizer: torch.optim.Optimizer
+    
+    def state_dict(self):
+        return {
+            'model': self.model.state_dict(),
+            'optimizer': self.optimizer.state_dict()
+        }
+    
+    def load_state_dict(self, state_dict):
+        self.model.load_state_dict(state_dict['model'])
+        self.optimizer.load_state_dict(state_dict['optimizer'])
 
 
 def create_classifier(
-    key: jnp.ndarray,
+    device: torch.device,
     sample: Dict,
     image_keys: List[str],
     pretrained_encoder_path: str = "../resnet10_params.pkl",
     n_way: int = 2,
-):
+) -> TrainState:
     pretrained_encoder = resnetv1_configs["resnetv1-10-frozen"](
         pre_pooling=True,
         name="pretrained_encoder",
@@ -69,57 +95,57 @@ def create_classifier(
         enable_stacking=True,
         image_keys=image_keys,
     )
+    
     if n_way == 2:
         classifier_def = BinaryClassifier(encoder_def=encoder_def)
     else:
         classifier_def = NWayClassifier(encoder_def=encoder_def, n_way=n_way)
-    params = classifier_def.init(key, sample)["params"]
-    classifier = TrainState.create(
-        apply_fn=classifier_def.apply,
-        params=params,
-        tx=optax.adam(learning_rate=1e-4),
-    )
-
+    
+    classifier_def = classifier_def.to(device)
+    optimizer = optim.Adam(classifier_def.parameters(), lr=1e-4)
+    
+    # Load pretrained encoder weights
     with open(pretrained_encoder_path, "rb") as f:
         encoder_params = pkl.load(f)
-    param_count = sum(x.size for x in jax.tree_leaves(encoder_params))
+    param_count = sum(p.numel() for p in encoder_params.values())
     print(
         f"Loaded {param_count/1e6}M parameters from ResNet-10 pretrained on ImageNet-1K"
     )
-    new_params = classifier.params
+    
+    # Update encoder parameters
+    state_dict = classifier_def.state_dict()
     for image_key in image_keys:
-        if "pretrained_encoder" in new_params["encoder_def"][f"encoder_{image_key}"]:
-            for k in new_params["encoder_def"][f"encoder_{image_key}"][
-                "pretrained_encoder"
-            ]:
-                if k in encoder_params:
-                    new_params["encoder_def"][f"encoder_{image_key}"][
-                        "pretrained_encoder"
-                    ][k] = encoder_params[k]
-                    print(f"replaced {k} in encoder_{image_key}")
-
-    classifier = classifier.replace(params=new_params)
-    return classifier
+        encoder_prefix = f"encoder_def.encoder_{image_key}.pretrained_encoder."
+        for k, v in encoder_params.items():
+            if k in state_dict[encoder_prefix]:
+                state_dict[encoder_prefix + k] = torch.tensor(v)
+                print(f"replaced {k} in encoder_{image_key}")
+    
+    classifier_def.load_state_dict(state_dict)
+    return TrainState(model=classifier_def, optimizer=optimizer)
 
 
 def load_classifier_func(
-    key: jnp.ndarray,
+    device: torch.device,
     sample: Dict,
     image_keys: List[str],
     checkpoint_path: str,
     n_way: int = 2,
-) -> Callable[[Dict], jnp.ndarray]:
+) -> Callable[[Dict], torch.Tensor]:
     """
     Return: a function that takes in an observation
             and returns the logits of the classifier.
     """
-    classifier = create_classifier(key, sample, image_keys, n_way=n_way)
-    classifier = checkpoints.restore_checkpoint(
-        checkpoint_path,
-        target=classifier,
-    )
-    func = lambda obs: classifier.apply_fn(
-        {"params": classifier.params}, obs, train=False
-    )
-    func = jax.jit(func)
-    return func
+    classifier = create_classifier(device, sample, image_keys, n_way=n_way)
+    
+    # Load checkpoint
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    classifier.load_state_dict(checkpoint)
+    
+    classifier.model.eval()
+    
+    def inference_fn(obs: Dict) -> torch.Tensor:
+        with torch.no_grad():
+            return classifier.model(obs, train=False)
+    
+    return inference_fn

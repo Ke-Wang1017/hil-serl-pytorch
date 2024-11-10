@@ -2,7 +2,7 @@ import collections
 from typing import Any, Iterator, Optional, Sequence, Tuple, Union
 
 import gymnasium as gym
-import jax
+import torch
 import numpy as np
 from serl_launcher.data.dataset import Dataset, DatasetDict
 
@@ -10,6 +10,7 @@ from serl_launcher.data.dataset import Dataset, DatasetDict
 def _init_replay_dict(
     obs_space: gym.Space, capacity: int
 ) -> Union[np.ndarray, DatasetDict]:
+    """Initialize replay buffer storage based on observation space."""
     if isinstance(obs_space, gym.spaces.Box):
         return np.empty((capacity, *obs_space.shape), dtype=obs_space.dtype)
     elif isinstance(obs_space, gym.spaces.Dict):
@@ -18,19 +19,20 @@ def _init_replay_dict(
             data_dict[k] = _init_replay_dict(v, capacity)
         return data_dict
     else:
-        raise TypeError()
+        raise TypeError(f"Unsupported observation space type: {type(obs_space)}")
 
 
 def _insert_recursively(
     dataset_dict: DatasetDict, data_dict: DatasetDict, insert_index: int
 ):
+    """Recursively insert data into dataset dictionary."""
     if isinstance(dataset_dict, np.ndarray):
         dataset_dict[insert_index] = data_dict
     elif isinstance(dataset_dict, dict):
         for k in dataset_dict.keys():
             _insert_recursively(dataset_dict[k], data_dict[k], insert_index)
     else:
-        raise TypeError()
+        raise TypeError(f"Unsupported type: {type(dataset_dict)}")
 
 
 class ReplayBuffer(Dataset):
@@ -44,6 +46,7 @@ class ReplayBuffer(Dataset):
         include_label: Optional[bool] = False,
         include_grasp_penalty: Optional[bool] = False,
     ):
+        """Initialize replay buffer with given spaces and capacity."""
         if next_observation_space is None:
             next_observation_space = observation_space
 
@@ -78,32 +81,39 @@ class ReplayBuffer(Dataset):
         return self._size
 
     def insert(self, data_dict: DatasetDict):
+        """Insert a transition into the replay buffer."""
         _insert_recursively(self.dataset_dict, data_dict, self._insert_index)
 
         self._insert_index = (self._insert_index + 1) % self._capacity
         self._size = min(self._size + 1, self._capacity)
 
-    def get_iterator(self, queue_size: int = 2, sample_args: dict = {}, device=None):
-        # See https://flax.readthedocs.io/en/latest/_modules/flax/jax_utils.html#prefetch_to_device
-        # queue_size = 2 should be ok for one GPU.
+    def get_iterator(self, queue_size: int = 2, sample_args: dict = {}, device: Optional[torch.device] = None):
+        """Get iterator over batches with optional device placement."""
         queue = collections.deque()
 
-        def enqueue(n):
+        def enqueue(n: int):
             for _ in range(n):
                 data = self.sample(**sample_args)
-                queue.append(jax.device_put(data, device=device))
+                if device is not None:
+                    data = {
+                        k: torch.tensor(v, device=device) if isinstance(v, np.ndarray) else v
+                        for k, v in data.items()
+                    }
+                queue.append(data)
 
         enqueue(queue_size)
         while queue:
             yield queue.popleft()
             enqueue(1)
 
-    def download(self, from_idx: int, to_idx: int):
+    def download(self, from_idx: int, to_idx: int) -> Tuple[int, DatasetDict]:
+        """Download a range of transitions from the buffer."""
         indices = np.arange(from_idx, to_idx)
         data_dict = self.sample(batch_size=len(indices), indx=indices)
         return to_idx, data_dict
 
-    def get_download_iterator(self):
+    def get_download_iterator(self) -> Iterator[DatasetDict]:
+        """Get iterator for downloading all transitions sequentially."""
         last_idx = 0
         while True:
             if last_idx >= self._size:

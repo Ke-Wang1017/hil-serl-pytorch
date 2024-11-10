@@ -6,15 +6,14 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 
 import imageio
-import jax
-import jax.numpy as jnp
+import torch
 import numpy as np
-import tensorflow as tf
 import wandb
-from flax.core import frozen_dict
-from flax.training import checkpoints
+from typing import Dict, Any
 
-def ask_for_frame(images_dict):    
+
+def ask_for_frame(images_dict: Dict[int, np.ndarray]) -> int:
+    """Display images and ask user to select first success frame."""
     # Create a new figure
     fig, axes = plt.subplots(5, 5, figsize=(15, 20))
     
@@ -44,66 +43,73 @@ def ask_for_frame(images_dict):
             continue
 
     plt.close(fig)
-    
     return first_success
 
-def concat_batches(offline_batch, online_batch, axis=1):
+
+def concat_batches(offline_batch: Dict, online_batch: Dict, axis: int = 1) -> Dict:
+    """Concatenate offline and online batches."""
     batch = defaultdict(list)
 
-    if not isinstance(offline_batch, dict):
-        offline_batch = offline_batch.unfreeze()
-
-    if not isinstance(online_batch, dict):
-        online_batch = online_batch.unfreeze()
-
     for k, v in offline_batch.items():
-        if type(v) is dict:
+        if isinstance(v, dict):
             batch[k] = concat_batches(offline_batch[k], online_batch[k], axis=axis)
         else:
-            batch[k] = jnp.concatenate((offline_batch[k], online_batch[k]), axis=axis)
+            if isinstance(v, torch.Tensor):
+                batch[k] = torch.cat((v, online_batch[k]), dim=axis)
+            else:
+                batch[k] = np.concatenate((v, online_batch[k]), axis=axis)
 
-    return frozen_dict.freeze(batch)
+    return batch
 
 
-def load_recorded_video(
-    video_path: str,
-):
-    with tf.io.gfile.GFile(video_path, "rb") as f:
-        video = np.array(imageio.mimread(f, "MP4")).transpose((0, 3, 1, 2))
-        assert video.shape[1] == 3, "Numpy array should be (T, C, H, W)"
-
+def load_recorded_video(video_path: str) -> wandb.Video:
+    """Load and prepare video for wandb logging."""
+    video = imageio.mimread(video_path, "MP4")
+    video = np.array(video).transpose((0, 3, 1, 2))
+    assert video.shape[1] == 3, "Numpy array should be (T, C, H, W)"
     return wandb.Video(video, fps=20)
 
 
-def _unpack(batch):
+def _unpack(batch: Dict) -> Dict:
     """
     Helps to minimize CPU to GPU transfer.
-    Assuming that if next_observation is missing, it's combined with observation:
-
-    :param batch: a batch of data from the replay buffer, a dataset dict
-    :return: a batch of unpacked data, a dataset dict
+    Assuming that if next_observation is missing, it's combined with observation.
+    
+    Args:
+        batch: A batch of data from the replay buffer
+        
+    Returns:
+        Unpacked batch with separated observations
     """
-
+    batch = batch.copy()
+    
     for pixel_key in batch["observations"].keys():
         if pixel_key not in batch["next_observations"]:
             obs_pixels = batch["observations"][pixel_key][:, :-1, ...]
             next_obs_pixels = batch["observations"][pixel_key][:, 1:, ...]
 
-            obs = batch["observations"].copy(add_or_replace={pixel_key: obs_pixels})
-            next_obs = batch["next_observations"].copy(
-                add_or_replace={pixel_key: next_obs_pixels}
-            )
-            batch = batch.copy(
-                add_or_replace={"observations": obs, "next_observations": next_obs}
-            )
+            obs = batch["observations"].copy()
+            obs[pixel_key] = obs_pixels
+            next_obs = batch["next_observations"].copy()
+            next_obs[pixel_key] = next_obs_pixels
+            
+            batch["observations"] = obs
+            batch["next_observations"] = next_obs
 
     return batch
 
 
-def load_resnet10_params(agent, image_keys=("image",), public=True):
+def load_resnet10_params(agent: Any, image_keys: tuple = ("image",), public: bool = True) -> Any:
     """
     Load pretrained resnet10 params from github release to an agent.
-    :return: agent with pretrained resnet10 params
+    
+    Args:
+        agent: The agent to load parameters into
+        image_keys: Keys for image observations
+        public: Whether to load from public release
+        
+    Returns:
+        Agent with pretrained resnet10 params
     """
     file_name = "resnet10_params.pkl"
     if not public:  # if github repo is not public, load from local file
@@ -115,6 +121,7 @@ def load_resnet10_params(agent, image_keys=("image",), public=True):
         if not os.path.exists(file_path):
             os.makedirs(file_path)
         file_path = os.path.join(file_path, file_name)
+        
         # Check if the file exists
         if os.path.exists(file_path):
             print(f"The ResNet-10 weights already exist at '{file_path}'.")
@@ -142,23 +149,22 @@ def load_resnet10_params(agent, image_keys=("image",), public=True):
         with open(file_path, "rb") as f:
             encoder_params = pkl.load(f)
 
-    param_count = sum(x.size for x in jax.tree_leaves(encoder_params))
-    print(
-        f"Loaded {param_count/1e6}M parameters from ResNet-10 pretrained on ImageNet-1K"
-    )
+    # Convert numpy arrays to torch tensors
+    encoder_params = {k: torch.from_numpy(v) if isinstance(v, np.ndarray) else v 
+                     for k, v in encoder_params.items()}
 
-    new_params = agent.state.params
+    param_count = sum(p.numel() for p in encoder_params.values() if isinstance(p, torch.Tensor))
+    print(f"Loaded {param_count/1e6}M parameters from ResNet-10 pretrained on ImageNet-1K")
 
+    # Update agent parameters
+    state_dict = agent.state.model.state_dict()
+    
     for image_key in image_keys:
-        new_encoder_params = new_params["modules_actor"]["encoder"][
-            f"encoder_{image_key}"
-        ]
-        if "pretrained_encoder" in new_encoder_params:
-            new_encoder_params = new_encoder_params["pretrained_encoder"]
-        for k in new_encoder_params:
-            if k in encoder_params:
-                new_encoder_params[k] = encoder_params[k]
+        encoder_prefix = f"modules_actor.encoder.encoder_{image_key}.pretrained_encoder."
+        for k, v in encoder_params.items():
+            if encoder_prefix + k in state_dict:
+                state_dict[encoder_prefix + k] = v
                 print(f"replaced {k} in pretrained_encoder")
-
-    agent = agent.replace(state=agent.state.replace(params=new_params))
+    
+    agent.state.model.load_state_dict(state_dict)
     return agent

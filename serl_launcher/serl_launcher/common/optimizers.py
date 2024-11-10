@@ -1,6 +1,7 @@
-from typing import Optional
-
-import optax
+from typing import Optional, Union, Tuple, Callable
+import torch
+import torch.optim as optim
+from torch.optim.lr_scheduler import LambdaLR
 
 
 def make_optimizer(
@@ -10,47 +11,92 @@ def make_optimizer(
     weight_decay: Optional[float] = None,
     clip_grad_norm: Optional[float] = None,
     return_lr_schedule: bool = False,
-) -> optax.GradientTransformation:
-    if cosine_decay_steps is not None:
-        learning_rate_schedule = optax.warmup_cosine_decay_schedule(
-            init_value=0.0,
-            peak_value=learning_rate,
-            warmup_steps=warmup_steps,
-            decay_steps=cosine_decay_steps,
-            end_value=0.0,
-        )
-    else:
-        learning_rate_schedule = optax.join_schedules(
-            [
-                optax.linear_schedule(0.0, learning_rate, warmup_steps),
-                optax.constant_schedule(learning_rate),
-            ],
-            [warmup_steps],
-        )
+) -> Union[optim.Optimizer, Tuple[optim.Optimizer, LambdaLR]]:
+    """
+    Create an optimizer with learning rate scheduling.
+    
+    Args:
+        learning_rate: Base learning rate
+        warmup_steps: Number of warmup steps
+        cosine_decay_steps: Number of steps for cosine decay (None for constant LR)
+        weight_decay: Weight decay coefficient
+        clip_grad_norm: Maximum norm for gradient clipping
+        return_lr_schedule: Whether to return the learning rate scheduler
+        
+    Returns:
+        Optimizer or tuple of (optimizer, scheduler)
+    """
+    def get_lr_lambda(step: int) -> float:
+        """Learning rate schedule function."""
+        if step < warmup_steps:
+            # Linear warmup
+            return float(step) / float(max(1, warmup_steps))
+        
+        if cosine_decay_steps is not None:
+            # Cosine decay after warmup
+            step = min(step - warmup_steps, cosine_decay_steps)
+            decay_ratio = float(step) / float(cosine_decay_steps)
+            coeff = 0.5 * (1.0 + torch.cos(torch.tensor(decay_ratio * 3.14159)))
+            return coeff.item()
+        
+        # Constant learning rate after warmup if no decay
+        return 1.0
 
-    # Define optimizers
-    @optax.inject_hyperparams
-    def optimizer(learning_rate: float, weight_decay: Optional[float]):
-        optimizer_stages = []
-
-        if clip_grad_norm is not None:
-            optimizer_stages.append(optax.clip_by_global_norm(clip_grad_norm))
-
+    # Create optimizer
+    def create_optimizer(params) -> optim.Optimizer:
         if weight_decay is not None:
-            optimizer_stages.append(
-                optax.adamw(learning_rate=learning_rate, weight_decay=weight_decay)
+            optimizer = optim.AdamW(
+                params,
+                lr=learning_rate,
+                weight_decay=weight_decay
             )
         else:
-            optimizer_stages.append(optax.adam(learning_rate=learning_rate))
+            optimizer = optim.Adam(
+                params,
+                lr=learning_rate
+            )
+        return optimizer
 
-        return optax.chain(*optimizer_stages)
-
-    if return_lr_schedule:
-        return (
-            optimizer(learning_rate=learning_rate_schedule, weight_decay=weight_decay),
-            learning_rate_schedule,
-        )
+    # Create optimizer wrapper with gradient clipping if needed
+    if clip_grad_norm is not None:
+        class OptimizerWithClipping:
+            def __init__(self, params):
+                self.optimizer = create_optimizer(params)
+                
+            def zero_grad(self):
+                self.optimizer.zero_grad()
+                
+            def step(self):
+                torch.nn.utils.clip_grad_norm_(
+                    self.optimizer.param_groups[0]['params'],
+                    clip_grad_norm
+                )
+                self.optimizer.step()
+                
+            def state_dict(self):
+                return self.optimizer.state_dict()
+            
+            def load_state_dict(self, state_dict):
+                self.optimizer.load_state_dict(state_dict)
+            
+            @property
+            def param_groups(self):
+                return self.optimizer.param_groups
+        
+        optimizer_class = OptimizerWithClipping
     else:
-        return optimizer(
-            learning_rate=learning_rate_schedule, weight_decay=weight_decay
+        optimizer_class = create_optimizer
+
+    # Return optimizer factory function
+    def optimizer_fn(params):
+        optimizer = optimizer_class(params)
+        scheduler = LambdaLR(
+            optimizer if not isinstance(optimizer, OptimizerWithClipping) else optimizer.optimizer,
+            lr_lambda=get_lr_lambda
         )
+        
+        if return_lr_schedule:
+            return optimizer, scheduler
+        return optimizer
+
+    return optimizer_fn

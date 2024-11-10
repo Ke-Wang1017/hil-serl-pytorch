@@ -1,37 +1,54 @@
 from typing import Sequence, Callable
-import flax.linen as nn
-import jax.numpy as jnp
+import torch
+import torch.nn as nn
 
 
 class SpatialLearnedEmbeddings(nn.Module):
-    height: int
-    width: int
-    channel: int
-    num_features: int = 5
-    param_dtype: jnp.dtype = jnp.float32
+    """Spatial learned embeddings module that learns position-sensitive features."""
+    
+    def __init__(
+        self,
+        height: int,
+        width: int,
+        channel: int,
+        num_features: int = 5,
+        dtype: torch.dtype = torch.float32
+    ):
+        super().__init__()
+        
+        # Initialize learnable kernel parameter
+        self.kernel = nn.Parameter(
+            torch.empty(height, width, channel, num_features, dtype=dtype)
+        )
+        # Initialize using Lecun normal initialization
+        nn.init.kaiming_normal_(self.kernel, mode='fan_in', nonlinearity='linear')
 
-    @nn.compact
-    def __call__(self, features):
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
         """
-        features is B x H x W X C
+        Process features through spatial learned embeddings.
+        
+        Args:
+            features: Input tensor of shape [B x H x W x C] or [H x W x C]
+            
+        Returns:
+            Processed features of shape [B x (C*num_features)] or [(C*num_features)]
         """
         squeeze = False
         if len(features.shape) == 3:
-            features = jnp.expand_dims(features, 0)
+            features = features.unsqueeze(0)
             squeeze = True
 
-        kernel = self.param(
-            "kernel",
-            nn.initializers.lecun_normal(),
-            (self.height, self.width, self.channel, self.num_features),
-            self.param_dtype,
-        )
-
         batch_size = features.shape[0]
-        features = jnp.sum(
-            jnp.expand_dims(features, -1) * jnp.expand_dims(kernel, 0), axis=(1, 2)
-        )
-        features = jnp.reshape(features, [batch_size, -1])
+        
+        # Expand dimensions for broadcasting
+        features = features.unsqueeze(-1)  # [B, H, W, C, 1]
+        kernel = self.kernel.unsqueeze(0)   # [1, H, W, C, num_features]
+        
+        # Compute spatial embeddings
+        features = (features * kernel).sum(dim=(1, 2))  # [B, C, num_features]
+        features = features.reshape(batch_size, -1)     # [B, C*num_features]
+        
         if squeeze:
-            features = jnp.squeeze(features, 0)
+            features = features.squeeze(0)
+            
         return features

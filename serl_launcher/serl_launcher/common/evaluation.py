@@ -1,22 +1,28 @@
 import math
 from collections import defaultdict
-from typing import Dict
+from typing import Dict, List, Tuple, Optional
 
 import gymnasium as gym
-import jax
+import torch
 import numpy as np
 
 
-def supply_rng(f, rng=jax.random.PRNGKey(0)):
+def supply_rng(f, generator=None):
+    """Supply a random number generator to a function."""
+    if generator is None:
+        generator = torch.Generator()
+        generator.manual_seed(0)
+        
     def wrapped(*args, **kwargs):
-        nonlocal rng
-        rng, key = jax.random.split(rng)
-        return f(*args, seed=key, **kwargs)
+        nonlocal generator
+        kwargs['generator'] = generator
+        return f(*args, **kwargs)
 
     return wrapped
 
 
-def flatten(d, parent_key="", sep="."):
+def flatten(d: Dict, parent_key: str = "", sep: str = ".") -> Dict:
+    """Flatten a nested dictionary into a flat dictionary with dot-separated keys."""
     items = []
     for k, v in d.items():
         new_key = parent_key + sep + k if parent_key else k
@@ -27,7 +33,8 @@ def flatten(d, parent_key="", sep="."):
     return dict(items)
 
 
-def filter_info(info):
+def filter_info(info: Dict) -> Dict:
+    """Filter out specific keys from info dictionary."""
     filter_keys = [
         "object_names",
         "target_object",
@@ -35,18 +42,27 @@ def filter_info(info):
         "target_position",
         "goal",
     ]
-    for k in filter_keys:
-        if k in info:
-            del info[k]
-    return info
+    return {k: v for k, v in info.items() if k not in filter_keys}
 
 
-def add_to(dict_of_lists, single_dict):
+def add_to(dict_of_lists: Dict[str, List], single_dict: Dict):
+    """Add values from single_dict to corresponding lists in dict_of_lists."""
     for k, v in single_dict.items():
         dict_of_lists[k].append(v)
 
 
 def evaluate(policy_fn, env: gym.Env, num_episodes: int) -> Dict[str, float]:
+    """
+    Evaluate a policy for a specified number of episodes.
+    
+    Args:
+        policy_fn: Function that takes observations and returns actions
+        env: Gymnasium environment
+        num_episodes: Number of episodes to evaluate
+        
+    Returns:
+        Dictionary of evaluation statistics
+    """
     stats = defaultdict(list)
     for _ in range(num_episodes):
         observation, info = env.reset()
@@ -59,14 +75,23 @@ def evaluate(policy_fn, env: gym.Env, num_episodes: int) -> Dict[str, float]:
             add_to(stats, flatten(info))
         add_to(stats, flatten(info, parent_key="final"))
 
-    for k, v in stats.items():
-        stats[k] = np.mean(v)
-    return stats
+    return {k: np.mean(v) for k, v in stats.items()}
 
 
 def evaluate_with_trajectories(
     policy_fn, env: gym.Env, num_episodes: int
-) -> Dict[str, float]:
+) -> Tuple[Dict[str, float], List[Dict]]:
+    """
+    Evaluate a policy and collect full trajectories.
+    
+    Args:
+        policy_fn: Function that takes observations and returns actions
+        env: Gymnasium environment
+        num_episodes: Number of episodes to evaluate
+        
+    Returns:
+        Tuple of (statistics dictionary, list of trajectory dictionaries)
+    """
     trajectories = []
     stats = defaultdict(list)
 
@@ -93,17 +118,42 @@ def evaluate_with_trajectories(
         add_to(stats, flatten(info, parent_key="final"))
         trajectories.append(trajectory)
 
-    for k, v in stats.items():
-        stats[k] = np.mean(v)
-    return stats, trajectories
+    return {k: np.mean(v) for k, v in stats.items()}, trajectories
 
 
-def bootstrap_std(arr, f=np.mean, n=30):
+def bootstrap_std(arr: np.ndarray, f=np.mean, n: int = 30) -> float:
+    """
+    Compute bootstrap standard deviation of a statistic.
+    
+    Args:
+        arr: Input array
+        f: Function to compute statistic
+        n: Number of bootstrap samples
+        
+    Returns:
+        Bootstrap standard deviation
+    """
     arr = np.array(arr)
-    return np.std([f(arr[np.random.choice(len(arr), len(arr))]) for _ in range(n)])
+    bootstrap_stats = [
+        f(arr[np.random.choice(len(arr), len(arr))]) 
+        for _ in range(n)
+    ]
+    return np.std(bootstrap_stats)
 
 
-def parallel_evaluate(policy_fn, eval_envs, num_eval, verbose=True):
+def parallel_evaluate(policy_fn, eval_envs, num_eval: int, verbose: bool = True) -> Tuple[List, List]:
+    """
+    Evaluate policy in parallel environments.
+    
+    Args:
+        policy_fn: Function that takes observations and returns actions
+        eval_envs: VectorEnv containing multiple environments
+        num_eval: Total number of evaluations to perform
+        verbose: Whether to print evaluation results
+        
+    Returns:
+        Tuple of (episode rewards, episode time rewards)
+    """
     n_envs = len(eval_envs.reset())
     eval_episode_rewards = []
     eval_episode_time_rewards = []
@@ -125,8 +175,11 @@ def parallel_evaluate(policy_fn, eval_envs, num_eval, verbose=True):
                 eval_episode_rewards.append(info["episode"]["r"])
                 eval_episode_time_rewards.append(info["episode"]["time_r"])
                 counter[n] += 1
+                
     if verbose:
         print(
-            f"Evaluation using {len(eval_episode_rewards)} episodes: mean reward {np.mean(eval_episode_rewards):.5f} +- {bootstrap_std(eval_episode_rewards):.5f} \n"
+            f"Evaluation using {len(eval_episode_rewards)} episodes: "
+            f"mean reward {np.mean(eval_episode_rewards):.5f} "
+            f"+- {bootstrap_std(eval_episode_rewards):.5f} \n"
         )
     return eval_episode_rewards, eval_episode_time_rewards
