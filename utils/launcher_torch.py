@@ -4,10 +4,12 @@ import torch
 import torch.nn as nn
 import numpy as np
 
-from wandb import WandBLogger
+from utils.wandb import WandBLogger
 from sac_torch import SACAgent
 from data_augmentations_torch import batched_random_crop
-from mlp_torch import MLP
+from networks.mlp_torch import MLP
+from agentlace.trainer import TrainerConfig
+
 
 
 def make_sac_pixel_agent(
@@ -36,12 +38,12 @@ def make_sac_pixel_agent(
             "std_max": 5,
         },
         critic_network_kwargs={
-            "activation": nn.Tanh(),
+            "activations": nn.Tanh(),
             "use_layer_norm": True,
             "hidden_dims": [256, 256],
         },
         policy_network_kwargs={
-            "activation": nn.Tanh(),
+            "activations": nn.Tanh(),
             "use_layer_norm": True,
             "hidden_dims": [256, 256],
         },
@@ -76,12 +78,12 @@ def make_sac_state_agent(
             "std_max": 5,
         },
         critic_network_kwargs={
-            "activation": nn.Tanh(),
+            "activations": nn.Tanh(),
             "use_layer_norm": True,
             "hidden_dims": [256, 256],
         },
         policy_network_kwargs={
-            "activation": nn.Tanh(),
+            "activations": nn.Tanh(),
             "use_layer_norm": True,
             "hidden_dims": [256, 256],
         },
@@ -132,12 +134,12 @@ def make_batch_augmentation_func(image_keys: tuple) -> callable:
     
     return augment_batch
 
-def make_trainer_config(port_number: int = 5588, broadcast_port: int = 5589) -> dict:
-    return {
-        "port_number": port_number,
-        "broadcast_port": broadcast_port,
-        "request_types": ["send-stats"],
-    }
+def make_trainer_config(port_number: int = 5588, broadcast_port: int = 5589):
+    return TrainerConfig(
+        port_number=port_number,
+        broadcast_port=broadcast_port,
+        request_types=["send-stats"],
+    )
 
 def make_wandb_logger(
     project: str = "hil-serl",

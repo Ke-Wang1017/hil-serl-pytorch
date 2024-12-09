@@ -27,15 +27,15 @@ from train_utils_torch import concat_batches
 from agentlace.trainer import TrainerServer, TrainerClient
 from agentlace.data.data_store import QueuedDataStore
 
-from launcher_torch import (
+from utils.launcher_torch import (
     make_sac_state_agent,
     make_sac_pixel_agent,
     make_trainer_config,
     make_wandb_logger,
 )
-from data_store_torch import MemoryEfficientReplayBufferDataStore
+from data.data_store_torch import MemoryEfficientReplayBufferDataStore
 
-from mappings import CONFIG_MAPPING
+from utils.mappings import CONFIG_MAPPING
 import mujoco.viewer
 
 def parse_args():
@@ -161,89 +161,91 @@ def actor(agent, data_store, intvn_data_store, env, args, device="cuda"):
     intervention_count = 0
     intervention_steps = 0
 
-    pbar = tqdm.tqdm(range(start_step, config.max_steps), dynamic_ncols=True)
-    for step in pbar:
-        timer.tick("total")
+    with mujoco.viewer.launch_passive(env.model, env.data) as viewer:
+        pbar = tqdm.tqdm(range(start_step, config.max_steps), dynamic_ncols=True)
+        for step in pbar:
+            timer.tick("total")
+            viewer.sync()
 
-        with timer.context("sample_actions"):
-            if step < config.random_steps:
-                actions = env.action_space.sample()
-            else:
-                with torch.no_grad():
-                    actions = agent.sample_actions(
-                        observations={k: torch.as_tensor(v, device=device) for k, v in obs.items()},
-                        argmax=False
-                    )
-                actions = actions.cpu().numpy()
+            with timer.context("sample_actions"):
+                if step < config.random_steps:
+                    actions = env.action_space.sample()
+                else:
+                    with torch.no_grad():
+                        actions = agent.sample_actions(
+                            observations={k: torch.as_tensor(v, device=device) for k, v in obs.items()},
+                            argmax=False
+                        )
+                    actions = actions.cpu().numpy()
 
-        # Environment step
-        with timer.context("step_env"):
-            next_obs, reward, done, truncated, info = env.step(actions)
+            # Environment step
+            with timer.context("step_env"):
+                next_obs, reward, done, truncated, info = env.step(actions)
 
-            if "left" in info: info.pop("left")
-            if "right" in info: info.pop("right")
+                if "left" in info: info.pop("left")
+                if "right" in info: info.pop("right")
 
-            if "intervene_action" in info:
-                actions = info.pop("intervene_action")
-                print("intervened!!!")
-                intervention_steps += 1
-                if not already_intervened:
-                    intervention_count += 1
-                already_intervened = True
-            else:
-                already_intervened = False
+                if "intervene_action" in info:
+                    actions = info.pop("intervene_action")
+                    print("intervened!!!")
+                    intervention_steps += 1
+                    if not already_intervened:
+                        intervention_count += 1
+                    already_intervened = True
+                else:
+                    already_intervened = False
 
-            running_return += reward
-            transition = dict(
-                observations=obs,
-                actions=actions,
-                next_observations=next_obs,
-                rewards=reward,
-                masks=1.0 - done,
-                dones=done,
-            )
-            if 'grasp_penalty' in info:
-                transition['grasp_penalty'] = info['grasp_penalty']
+                running_return += reward
+                transition = dict(
+                    observations=obs,
+                    actions=actions,
+                    next_observations=next_obs,
+                    rewards=reward,
+                    masks=1.0 - done,
+                    dones=done,
+                )
+                if 'grasp_penalty' in info:
+                    transition['grasp_penalty'] = info['grasp_penalty']
 
-            data_store.insert(transition)
-            transitions.append(copy.deepcopy(transition))
-            if already_intervened:
-                intvn_data_store.insert(transition)
-                demo_transitions.append(copy.deepcopy(transition))
+                data_store.insert(transition)
+                transitions.append(copy.deepcopy(transition))
+                if already_intervened:
+                    intvn_data_store.insert(transition)
+                    demo_transitions.append(copy.deepcopy(transition))
 
-            obs = next_obs
-            if done or truncated:
-                info["episode"]["intervention_count"] = intervention_count
-                info["episode"]["intervention_steps"] = intervention_steps
-                stats = {"environment": info}
-                client.request("send-stats", stats)
-                pbar.set_description(f"last return: {running_return}")
-                running_return = 0.0
-                intervention_count = 0
-                intervention_steps = 0
-                already_intervened = False
-                client.update()
-                obs, _ = env.reset()
+                obs = next_obs
+                if done or truncated:
+                    info["episode"]["intervention_count"] = intervention_count
+                    info["episode"]["intervention_steps"] = intervention_steps
+                    stats = {"environment": info}
+                    client.request("send-stats", stats)
+                    pbar.set_description(f"last return: {running_return}")
+                    running_return = 0.0
+                    intervention_count = 0
+                    intervention_steps = 0
+                    already_intervened = False
+                    client.update()
+                    obs, _ = env.reset()
 
-        # Save buffer periodically
-        if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
-            buffer_path = os.path.join(args.checkpoint_path, "buffer")
-            demo_buffer_path = os.path.join(args.checkpoint_path, "demo_buffer")
-            os.makedirs(buffer_path, exist_ok=True)
-            os.makedirs(demo_buffer_path, exist_ok=True)
-            
-            with open(os.path.join(buffer_path, f"transitions_{step}.pkl"), "wb") as f:
-                pkl.dump(transitions, f)
-                transitions = []
-            with open(os.path.join(demo_buffer_path, f"transitions_{step}.pkl"), "wb") as f:
-                pkl.dump(demo_transitions, f)
-                demo_transitions = []
+            # Save buffer periodically
+            if step > 0 and config.buffer_period > 0 and step % config.buffer_period == 0:
+                buffer_path = os.path.join(args.checkpoint_path, "buffer")
+                demo_buffer_path = os.path.join(args.checkpoint_path, "demo_buffer")
+                os.makedirs(buffer_path, exist_ok=True)
+                os.makedirs(demo_buffer_path, exist_ok=True)
+                
+                with open(os.path.join(buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(transitions, f)
+                    transitions = []
+                with open(os.path.join(demo_buffer_path, f"transitions_{step}.pkl"), "wb") as f:
+                    pkl.dump(demo_transitions, f)
+                    demo_transitions = []
 
-        timer.tock("total")
+            timer.tock("total")
 
-        if step % config.log_period == 0:
-            stats = {"timer": timer.get_average_times()}
-            client.request("send-stats", stats) 
+            if step % config.log_period == 0:
+                stats = {"timer": timer.get_average_times()}
+                client.request("send-stats", stats) 
 
 def learner(agent, replay_buffer, demo_buffer, wandb_logger=None, args=None, device="cuda"):
     """Learner loop implementation"""
@@ -280,9 +282,10 @@ def learner(agent, replay_buffer, demo_buffer, wandb_logger=None, args=None, dev
         time.sleep(1)
     pbar.update(len(replay_buffer) - pbar.n)
     pbar.close()
-
+    breakpoint()
     # Send initial network to actor
-    server.publish_network({k: v.cpu().numpy() for k, v in agent.state_dict().items()})
+    # server.publish_network({k: v.cpu().numpy() for k, v in agent.state_dict().items()})
+    server.publish_network(agent.state_dict().items())
     print_green("sent initial network to actor")
 
     # Setup iterators for 50/50 sampling from demo and online experience
@@ -338,8 +341,8 @@ def learner(agent, replay_buffer, demo_buffer, wandb_logger=None, args=None, dev
         # Publish updated network
         if step > 0 and step % config.steps_per_update == 0:
             torch.cuda.synchronize()  # Ensure all operations are complete
-            server.publish_network({k: v.cpu().numpy() for k, v in agent.state_dict().items()})
-
+            # server.publish_network({k: v.cpu().numpy() for k, v in agent.state_dict().items()})
+            server.publish_network(agent.state_dict().items())
         if step % config.log_period == 0 and wandb_logger:
             wandb_logger.log(update_info, step=step)
             wandb_logger.log({"timer": timer.get_average_times()}, step=step)
@@ -396,7 +399,7 @@ def main():
     else:
         raise NotImplementedError(f"Unknown setup mode: {config.setup_mode}")
 
-    agent = agent.to(device)
+    # agent = agent.to(device)
 
     if args.checkpoint_path is not None and os.path.exists(args.checkpoint_path):
         input("Checkpoint path already exists. Press Enter to resume training.")

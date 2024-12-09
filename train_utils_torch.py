@@ -7,7 +7,7 @@ import matplotlib.pyplot as plt
 import imageio
 import torch
 import numpy as np
-import wandb
+import utils.wandb as wandb
 from copy import deepcopy
 
 def ask_for_frame(images_dict):    

@@ -10,8 +10,10 @@ class LagrangeMultiplier(nn.Module):
         constraint_shape: Sequence[int] = (),
         constraint_type: str = "eq",  # One of ("eq", "leq", "geq")
         parameterization: Optional[str] = None,  # One of ("softplus", "exp"), or None for equality constraints
+        device: str = "cuda"
     ):
         super().__init__()
+        self.device = torch.device(device)
         self.constraint_type = constraint_type
         self.parameterization = parameterization
         
@@ -20,9 +22,9 @@ class LagrangeMultiplier(nn.Module):
             assert init_value > 0, "Inequality constraints must have non-negative initial multiplier values"
             
             if parameterization == "softplus":
-                init_value = torch.log(torch.exp(torch.tensor(init_value)) - 1)
+                init_value = torch.log(torch.exp(torch.tensor(init_value, device=self.device)) - 1)
             elif parameterization == "exp":
-                init_value = torch.log(torch.tensor(init_value))
+                init_value = torch.log(torch.tensor(init_value, device=self.device))
             elif parameterization == "none":
                 pass
             else:
@@ -32,8 +34,10 @@ class LagrangeMultiplier(nn.Module):
             
         # Initialize the Lagrange multiplier as a parameter
         self.lagrange = nn.Parameter(
-            torch.full(constraint_shape, init_value, dtype=torch.float32)
+            torch.full(constraint_shape, init_value, dtype=torch.float32, device=self.device)
         )
+        
+        self.to(self.device)
 
     def forward(
         self, 
@@ -57,9 +61,14 @@ class LagrangeMultiplier(nn.Module):
         if lhs is None:
             return multiplier
             
+        # Move inputs to device
+        lhs = lhs.to(self.device)
+        if rhs is not None:
+            rhs = rhs.to(self.device)
+            
         # Use the multiplier to compute the Lagrange penalty
         if rhs is None:
-            rhs = torch.zeros_like(lhs)
+            rhs = torch.zeros_like(lhs, device=self.device)
             
         diff = lhs - rhs
         

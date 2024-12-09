@@ -1,14 +1,16 @@
 from functools import partial
-from typing import Dict, Optional, Tuple, FrozenSet, Sequence
+from typing import Dict, Optional, Tuple, FrozenSet
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
 
-from actor_critic_nets_torch import Policy, Critic, create_critic_ensemble
-from lagrange_torch import GeqLagrangeMultiplier
-from mlp_torch import MLP
+from networks import Policy, Critic, create_critic_ensemble
+from networks.lagrange_torch import GeqLagrangeMultiplier
+from networks.mlp_torch import MLP
+from common.encoding import EncodingWrapper
+
 
 class SACAgent:
     """
@@ -421,19 +423,33 @@ class SACAgent:
         """
         policy_network_kwargs["activate_final"] = True
         critic_network_kwargs["activate_final"] = True
+        encoder_wrapper = EncodingWrapper(
+            encoder=None,
+            use_proprio=True,
+            proprio_latent_dim=256,
+            enable_stacking=True,
+            image_keys=[]
+        ).to(device)
+
+        encoders = {
+            "critic": encoder_wrapper,
+            "actor": encoder_wrapper,
+        }
 
         # Define networks
         policy = Policy(
-            encoder=None,
-            network=MLP(**policy_network_kwargs),
+            encoder=encoders["actor"],
+            network=MLP(**policy_network_kwargs), 
             action_dim=actions.shape[-1],
+            activate_final=policy_network_kwargs["activate_final"],
             **policy_kwargs
         ).to(device)
 
         # Create ensemble of critics using the imported function
         critic_base = lambda: Critic(
-            encoder=None,
-            network=MLP(**critic_network_kwargs)
+            encoder=encoders["critic"],
+            network=MLP(**critic_network_kwargs),
+            activate_final=critic_network_kwargs["activate_final"],
         )
         critic = create_critic_ensemble(critic_base, critic_ensemble_size)
         critic = critic.to(device)  # Move entire ensemble to device
@@ -478,60 +494,16 @@ class SACAgent:
             temp_optimizer=temp_optimizer,
             config=config
         )
- 
-    def update_high_utd(
-        self,
-        batch: Dict[str, torch.Tensor],
-        *,
-        utd_ratio: int,
-    ) -> Tuple["SACAgent", dict]:
-        """
-        High-UTD (Update-to-Data) version of `.update`.
-        
-        Splits the batch into minibatches, performs `utd_ratio` critic
-        (and target) updates, and then one actor/temperature update.
-        
-        Batch dimension must be divisible by `utd_ratio`.
-        """
-        batch_size = batch["rewards"].shape[0]
-        assert (
-            batch_size % utd_ratio == 0
-        ), f"Batch size {batch_size} must be divisible by UTD ratio {utd_ratio}"
-        minibatch_size = batch_size // utd_ratio
-        
-        # Move batch to device
-        batch = {k: torch.as_tensor(v, device=self.device) for k, v in batch.items()}
-        
-        # Create minibatches
-        minibatches = {
-            k: v.reshape(utd_ratio, minibatch_size, *v.shape[1:])
-            for k, v in batch.items()
+
+    def state_dict(self) -> Dict[str, Dict]:
+        """Return the state dict of the agent's components."""
+        return {
+            "actor": self.actor.state_dict(),
+            "critic": self.critic.state_dict(),
+            "critic_target": self.critic_target.state_dict(),
+            "temp": self.temp.state_dict(),
+            # "actor_optimizer": self.actor_optimizer.state_dict(),
+            # "critic_optimizer": self.critic_optimizer.state_dict(),
+            # "temp_optimizer": self.temp_optimizer.state_dict(),
         }
-        
-        # Perform critic updates
-        critic_infos = []
-        for i in range(utd_ratio):
-            minibatch = {k: v[i] for k, v in minibatches.items()}
-            _, info = self.update(
-                minibatch, 
-                networks_to_update=frozenset({"critic"})
-            )
-            critic_infos.append(info)
-        
-        # Average critic infos
-        critic_info = {}
-        for key in critic_infos[0].keys():
-            if key not in ["actor", "temperature"]:
-                values = [info[key] for info in critic_infos]
-                critic_info[key] = sum(values) / len(values)
-        
-        # Take one gradient descent step on the actor and temperature
-        _, actor_temp_info = self.update(
-            batch,
-            networks_to_update=frozenset({"actor", "temperature"})
-        )
-        
-        # Combine infos
-        info = {**critic_info, **{k: v for k, v in actor_temp_info.items() if k != "critic"}}
-        
-        return self, info
+ 

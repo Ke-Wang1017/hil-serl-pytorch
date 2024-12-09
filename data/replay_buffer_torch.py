@@ -3,7 +3,7 @@ from typing import Any, Iterator, Optional, Sequence, Tuple, Union
 import torch
 import gymnasium as gym
 import numpy as np
-from dataset_torch import Dataset, DatasetDict
+from data.dataset_torch import Dataset, DatasetDict
 
 
 def _init_replay_dict(
@@ -37,7 +37,7 @@ def _insert_recursively(
         if isinstance(data_dict, np.ndarray):
             dataset_dict[insert_index] = torch.from_numpy(data_dict).to(dataset_dict.device)
         else:
-            dataset_dict[insert_index] = data_dict
+            dataset_dict[insert_index] = torch.tensor(data_dict).to(dataset_dict.device)
     elif isinstance(dataset_dict, dict):
         for k in dataset_dict.keys():
             _insert_recursively(dataset_dict[k], data_dict[k], insert_index)

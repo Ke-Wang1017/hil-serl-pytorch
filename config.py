@@ -9,38 +9,46 @@ from franka_env.envs.wrappers import (
     JoystickIntervention,
     MultiCameraBinaryRewardClassifierWrapper,
     GripperPenaltyWrapper,
+    GripperCloseEnv,
+    ControllerType
 )
 from franka_env.envs.relative_env import RelativeFrame
 from serl_launcher.wrappers.serl_obs_wrappers import SERLObsWrapper
 from serl_launcher.wrappers.chunking import ChunkingWrapper
 from serl_launcher.networks.reward_classifier import load_classifier_func
 
-from default_config import DefaultTrainingConfig
+from utils.default_config import DefaultTrainingConfig
 from franka_sim.envs.panda_pick_gym_env import PandaPickCubeGymEnv
 
 
 class TrainConfig(DefaultTrainingConfig):
-    image_keys = ["front", "wrist"]
+    controller_type = ControllerType.XBOX
+    # image_keys = ["front", "wrist"]
+    image_keys = []
     classifier_keys = ["front", "wrist"]
-    proprio_keys = ["tcp_pose", "tcp_vel", "gripper_pose"]
-    buffer_period = 2000
+    use_proprio = True
+    proprio_keys = ["tcp_pose", "tcp_vel", "gripper_pose", "block_pos"]
+    buffer_period = 20000
     replay_buffer_capacity = 50000
-    batch_size = 64
+    batch_size = 16
     random_steps = 0
     checkpoint_period = 5000
     steps_per_update = 50
     encoder_type = "resnet-pretrained"
-    setup_mode = "single-arm-learned-gripper"
+    # setup_mode = "single-arm-learned-gripper"
+    setup_mode = "state_agent"
     fake_env = False
     classifier = False
 
     def get_environment(self, fake_env=False, save_video=False, classifier=False):
-        env = PandaPickCubeGymEnv(render_mode="human", image_obs=True, time_limit=100.0, control_dt=0.1)
+        # env = PandaPickCubeGymEnv(render_mode="human", image_obs=True, time_limit=100.0, control_dt=0.1)
+        env = PandaPickCubeGymEnv(render_mode="human", image_obs=False, time_limit=100.0, control_dt=0.1)
+
         if not fake_env:
-            env = JoystickIntervention(env)
+            env = JoystickIntervention(env=env, controller_type=self.controller_type)
         env = RelativeFrame(env)
         env = Quat2EulerWrapper(env)
-        env = SERLObsWrapper(env, proprio_keys=self.proprio_keys)
+        env = SERLObsWrapper(env, proprio_keys=self.proprio_keys, image_obs=False)
         env = ChunkingWrapper(env, obs_horizon=1, act_exec_horizon=None)
         if classifier:
             classifier = load_classifier_func(

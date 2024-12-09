@@ -3,8 +3,8 @@ from typing import Union, Iterable
 
 import gymnasium as gym
 import torch
-from replay_buffer_torch import ReplayBuffer
-from memory_efficient_replay_buffer_torch import (
+from data.replay_buffer_torch import ReplayBuffer
+from data.memory_efficient_replay_buffer_torch import (
     MemoryEfficientReplayBuffer,
 )
 

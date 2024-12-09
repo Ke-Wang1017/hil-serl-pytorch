@@ -3,8 +3,8 @@ from typing import Iterable, Optional, Tuple
 import torch
 import gymnasium as gym
 import numpy as np
-from dataset_torch import DatasetDict, _sample
-from replay_buffer_torch import ReplayBuffer
+from data.dataset_torch import DatasetDict, _sample
+from data.replay_buffer_torch import ReplayBuffer
 from gymnasium.spaces import Box
 
 class MemoryEfficientReplayBuffer(ReplayBuffer):
@@ -22,10 +22,10 @@ class MemoryEfficientReplayBuffer(ReplayBuffer):
         self.device = torch.device(device)
 
         observation_space = copy.deepcopy(observation_space)
-        self._num_stack = None
+        self._num_stack = 0
         for pixel_key in self.pixel_keys:
             pixel_obs_space = observation_space.spaces[pixel_key]
-            if self._num_stack is None:
+            if self._num_stack==0:
                 self._num_stack = pixel_obs_space.shape[0]
             else:
                 assert self._num_stack == pixel_obs_space.shape[0]
